@@ -7,9 +7,21 @@ import os
 import copy
 
 from collections import namedtuple
+from functools import partial
+
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
+from einops import rearrange
+
+
+from mamba_ssm.distributed.distributed_utils import (
+    all_gather
+)
+
+
+
 
 from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.modules.mamba_simple import Mamba
@@ -19,11 +31,15 @@ from mamba_ssm.modules.mlp import GatedMLP
 from mamba_ssm.modules.block import Block
 from mamba_ssm.utils.generation import GenerationMixin
 from mamba_ssm.utils.hf import load_config_hf, load_state_dict_hf
+from mamba_ssm.distributed.tensor_parallel import ParallelEmbeddings
+
 
 try:
     from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn, rms_norm_fn
 except ImportError:
     RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
+
+
 
 
 def create_block(
@@ -49,8 +65,7 @@ def create_block(
     factory_kwargs = {"device": device, "dtype": dtype}
     if layer_idx not in attn_layer_idx:
         # Create a copy of the config to modify
-        ssm_cfg = copy.deepcopy(ssm_cfg) if ssm_cfg is not None else {}
-        ssm_layer = ssm_cfg.pop("layer", "Mamba1")
+        ssm_layer = ssm_cfg["layer"]
         if ssm_layer not in ["Mamba1", "Mamba2"]:
             raise ValueError(f"Invalid ssm_layer: {ssm_layer}, only support Mamba1 and Mamba2")
         mixer_cls = partial(
@@ -122,7 +137,10 @@ class MixerModel(nn.Module):
         n_layer: int,
         d_intermediate: int,
         vocab_size: int,
+        seq_len: int, 
         ssm_cfg=None,
+        num_grad_ckpt=0,
+        sequence_parallel=False,
         attn_layer_idx=None,
         attn_cfg=None,
         norm_epsilon: float = 1e-5,
@@ -135,9 +153,23 @@ class MixerModel(nn.Module):
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
-        self.residual_in_fp32 = residual_in_fp32
 
-        self.embedding = nn.Embedding(vocab_size, d_model, **factory_kwargs)
+        self.process_group = ssm_cfg["process_group"]
+        self.residual_in_fp32 = residual_in_fp32
+        self.num_grad_ckpt = num_grad_ckpt
+        self.sequence_parallel = sequence_parallel
+        self.seq_len = seq_len
+
+        if sequence_parallel:
+            self.embedding = ParallelEmbeddings(d_model, vocab_size, max_position_embeddings=0, process_group=self.process_group, **factory_kwargs)
+            self.embedding_fwd = partial(self.embedding.forward, combine_batch_seqlen_dim = True)
+        else:
+            self.embedding = nn.Embedding(vocab_size, d_model, **factory_kwargs)
+            self.embedding_fwd = self.embedding.forward
+
+
+        print(next(self.embedding.parameters()).device)
+
 
         # We change the order of residual and layer norm:
         # Instead of LN -> Attn / MLP -> Add, we do:
@@ -168,6 +200,15 @@ class MixerModel(nn.Module):
             ]
         )
 
+        self.layer_fwds = []
+
+        for layer in self.layers:
+            layer_fwd = layer.forward
+            if sequence_parallel:
+                layer_fwd = partial(layer_fwd, seqlen=self.seq_len)
+            self.layer_fwds.append(layer_fwd)
+
+
         self.norm_f = (nn.LayerNorm if not rms_norm else RMSNorm)(
             d_model, eps=norm_epsilon, **factory_kwargs
         )
@@ -187,18 +228,36 @@ class MixerModel(nn.Module):
             for i, layer in enumerate(self.layers)
         }
 
+
     def forward(self, input_ids, inference_params=None, **mixer_kwargs):
-        hidden_states = self.embedding(input_ids)
+
+
+        hidden_states = self.embedding_fwd(input_ids)
         residual = None
-        for layer in self.layers:
-            hidden_states, residual = layer(
-                hidden_states, residual, inference_params=inference_params, **mixer_kwargs
-            )
+        
+        if self.num_grad_ckpt == 0:
+            # No checkpointing, standard forward pass
+            for layer_fwd in self.layer_fwds:
+                hidden_states, residual = layer_fwd(hidden_states, residual, inference_params, **mixer_kwargs)
+        else:
+            # Apply checkpointing every n layers
+            for i in range(0, len(self.layer_fwds), self.num_grad_ckpt):
+                chunk = self.layer_fwds[i : i + self.num_grad_ckpt]  # Get a chunk of n layers
+                
+                def chunk_forward(*inputs):
+                    hs, res = inputs[:2]
+                    for l in chunk:
+                        hs, res = l(hs, res, inference_params, **mixer_kwargs)
+                    return hs, res
+                
+                hidden_states, residual = torch.utils.checkpoint.checkpoint(
+                    chunk_forward, hidden_states, residual, use_reentrant=False # TODO: verify reentrant is what we want
+                )
+        
         if not self.fused_add_norm:
             residual = (hidden_states + residual) if residual is not None else hidden_states
             hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
         else:
-            # Set prenorm=False here since we don't need the residual
             hidden_states = layer_norm_fn(
                 hidden_states,
                 self.norm_f.weight,
@@ -207,8 +266,15 @@ class MixerModel(nn.Module):
                 residual=residual,
                 prenorm=False,
                 residual_in_fp32=self.residual_in_fp32,
-                is_rms_norm=isinstance(self.norm_f, RMSNorm)
+                is_rms_norm=isinstance(self.norm_f, RMSNorm),
             )
+
+
+        if self.sequence_parallel:
+            hidden_states = all_gather(hidden_states, self.process_group)
+            hidden_states = rearrange(hidden_states, "(b s) d -> b s d", s = self.seq_len)
+
+        
         return hidden_states
 
 
@@ -221,18 +287,23 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         device=None,
         dtype=None,
     ) -> None:
+        print("CNFIG", config.ssm_cfg)
         self.config = config
         d_model = config.d_model
         n_layer = config.n_layer
         d_intermediate = config.d_intermediate
         vocab_size = config.vocab_size
         ssm_cfg = config.ssm_cfg
+        num_grad_ckpt = config.num_grad_ckpt
+        sequence_parallel = ssm_cfg["sequence_parallel"]
+        seq_len = config.seq_len
         attn_layer_idx = config.attn_layer_idx
         attn_cfg = config.attn_cfg
         rms_norm = config.rms_norm
         residual_in_fp32 = config.residual_in_fp32
         fused_add_norm = config.fused_add_norm
         pad_vocab_size_multiple = config.pad_vocab_size_multiple
+    
         factory_kwargs = {"device": device, "dtype": dtype}
 
         super().__init__()
@@ -243,7 +314,10 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
             n_layer=n_layer,
             d_intermediate=d_intermediate,
             vocab_size=vocab_size,
+            seq_len=seq_len,
             ssm_cfg=ssm_cfg,
+            num_grad_ckpt=num_grad_ckpt,
+            sequence_parallel=sequence_parallel,
             attn_layer_idx=attn_layer_idx,
             attn_cfg=attn_cfg,
             rms_norm=rms_norm,
