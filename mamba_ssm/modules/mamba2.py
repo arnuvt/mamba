@@ -55,6 +55,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         dt_limit=(0.0, float("inf")),
         bias=False,
         conv_bias=True,
+        layer = "Mamba2", # dummy arg to prevent need to copy.deepcopy in mixer_seq_simple.py
         # Fused kernel and sharding options
         chunk_size=256,
         use_mem_eff_path=True,
@@ -91,7 +92,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         self.chunk_size = chunk_size
         self.use_mem_eff_path = use_mem_eff_path
         self.layer_idx = layer_idx
-
+        
         # Order: [z, x, B, C, dt]
         d_in_proj = 2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads
         if self.process_group is None:
